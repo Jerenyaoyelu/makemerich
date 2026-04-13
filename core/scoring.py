@@ -1,34 +1,33 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Iterable
-
 import pandas as pd
 
-from core.models import StockSignal
+REQUIRED_SCORE_COLS = {
+    "theme_strength",
+    "sector_linkage",
+    "stock_strength",
+    "capital_support",
+}
 
 
-def score_signals(
-    signals: Iterable[StockSignal],
+def score_frame(
+    frame: pd.DataFrame,
     w_theme: float,
     w_sector: float,
     w_stock: float,
     w_capital: float,
 ) -> pd.DataFrame:
-    rows = []
-    for item in signals:
-        total_score = (
-            item.theme_strength * w_theme
-            + item.sector_linkage * w_sector
-            + item.stock_strength * w_stock
-            + item.capital_support * w_capital
-        )
-        row = asdict(item)
-        row["total_score"] = round(total_score, 2)
-        rows.append(row)
-
-    frame = pd.DataFrame(rows)
+    missing = REQUIRED_SCORE_COLS - set(frame.columns)
+    if missing:
+        raise ValueError(f"缺少打分字段: {sorted(missing)}")
     if frame.empty:
         return frame
-    return frame.sort_values(by="total_score", ascending=False).reset_index(drop=True)
+    scored = frame.copy()
+    scored["total_score"] = (
+        scored["theme_strength"] * w_theme
+        + scored["sector_linkage"] * w_sector
+        + scored["stock_strength"] * w_stock
+        + scored["capital_support"] * w_capital
+    ).round(2)
+    return scored.sort_values(by="total_score", ascending=False).reset_index(drop=True)
 
