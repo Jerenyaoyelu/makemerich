@@ -317,6 +317,11 @@ def main() -> None:
     with st.sidebar:
         st.subheader("数据源")
         data_source = st.radio("选择数据来源", ["自动采集（推荐）", "样例数据（离线演示）"], index=0)
+        market_scope = st.selectbox(
+            "采集范围",
+            options=["全部A股", "沪深两市（主板）", "创业板", "科创板"],
+            index=0,
+        )
         refresh_limit = st.slider("自动采集股票数量上限", 100, 1000, 300, 50)
         refresh_btn = st.button("刷新实时数据")
         use_local_btn = st.button("手动加载本地缓存数据")
@@ -341,8 +346,15 @@ def main() -> None:
     if refresh_btn:
         progress = st.progress(0, text="准备刷新实时数据...")
         try:
+            scope_map = {
+                "全部A股": "all_a",
+                "沪深两市（主板）": "hs_main",
+                "创业板": "gem",
+                "科创板": "star",
+            }
             live = fetch_live_signals(
                 limit=refresh_limit,
+                market_scope=scope_map.get(market_scope, "all_a"),
                 progress_callback=lambda p, msg: progress.progress(p, text=msg),
             )
             progress.progress(75, text="正在写入本地数据文件...")
@@ -378,9 +390,16 @@ def main() -> None:
                 st.session_state["force_local_file"] = False
             else:
                 try:
+                    scope_map = {
+                        "全部A股": "all_a",
+                        "沪深两市（主板）": "hs_main",
+                        "创业板": "gem",
+                        "科创板": "star",
+                    }
                     progress.progress(20, text="正在获取筛选输入数据...")
                     frame = fetch_live_signals(
                         limit=refresh_limit,
+                        market_scope=scope_map.get(market_scope, "all_a"),
                         progress_callback=lambda p, msg: progress.progress(p, text=f"筛选前数据准备：{msg}"),
                     )
                     progress.progress(60, text="正在写入缓存文件...")
@@ -399,6 +418,9 @@ def main() -> None:
         scored = score_frame(frame, w_theme, w_sector, w_stock, w_capital)
         filtered = scored[scored["total_score"] >= score_threshold].head(top_n)
         progress.progress(100, text="筛选完成")
+
+        if "theme_source" in scored.columns and (scored["theme_source"] == "unknown").mean() > 0.7:
+            st.info("当前处于无行业模式（行业字段覆盖不足），建议降低题材强度/板块联动权重，先验证主流程。")
 
         render_data_quality_panel(scored)
 

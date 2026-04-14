@@ -6,6 +6,7 @@
 
 - 用户界面（Streamlit）
 - 自动采集 A 股实时行情（akshare）
+- 支持按交易板块采集：全部A股 / 沪深两市（主板）/ 创业板 / 科创板
 - 自动计算核心指标（题材强度、板块联动、个股强度、资金承接）
 - 自动打分并输出候选股列表
 - 数据质量诊断面板（行业/换手/量比覆盖率与风险提示）
@@ -77,6 +78,11 @@ python scripts/evaluate_candidates_next_day.py --input output/candidates_YYYYMMD
 - `volume_ratio`：量比（实时行情；缺失时显示为缺失并在打分中按可用性降权）
 - `amplitude`：振幅（实时行情）
 - `theme`：行业（实时字段优先；缺失时尝试行业映射缓存回填）
+  - 行业映射构建优先级：Tushare `stock_basic` -> 同花顺分页抓取 -> 本地缓存
+
+## 环境变量
+
+- `TUSHARE_TOKEN`：用于拉取股票行业主数据（建议在 `.env` 配置）
 - `theme_strength`：行业平均涨幅 + 行业成交额（归一化）
 - `sector_linkage`：行业平均涨幅 + 行业内上涨占比（归一化）
 - `stock_strength`：涨跌幅 + 量比 + 振幅（归一化）

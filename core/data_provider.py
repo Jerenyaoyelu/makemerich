@@ -8,6 +8,7 @@ from typing import Callable, Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
+from bs4 import BeautifulSoup
 
 from core.models import StockSignal
 
@@ -23,7 +24,15 @@ REQUIRED_COLS = [
 ]
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 INDUSTRY_MAP_PATH = DATA_DIR / "industry_map.csv"
+INDUSTRY_MAP_STATUS_PATH = DATA_DIR / "industry_map_status.txt"
 ProgressCallback = Callable[[int, str], None]
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+except Exception:
+    pass
 
 
 def _pick_col(columns: Iterable[str], candidates: List[str]) -> str | None:
@@ -73,7 +82,11 @@ def load_sample_signals(csv_path: str | Path) -> pd.DataFrame:
     return frame.copy()
 
 
-def fetch_live_signals(limit: int = 300, progress_callback: ProgressCallback | None = None) -> pd.DataFrame:
+def fetch_live_signals(
+    limit: int = 300,
+    progress_callback: ProgressCallback | None = None,
+    market_scope: str = "all_a",
+) -> pd.DataFrame:
     try:
         import akshare as ak
     except Exception as exc:
@@ -146,6 +159,9 @@ def fetch_live_signals(limit: int = 300, progress_callback: ProgressCallback | N
 
     data = data[~data["name"].str.contains("ST", na=False)].copy()
     data = data[data["amount"] > 0].copy()
+    data = _filter_by_market_scope(data, market_scope)
+    if data.empty:
+        raise RuntimeError("按当前采集范围过滤后无可用股票，请调整采集范围。")
 
     # 行业回填：优先读取本地行业映射缓存；若不存在则尝试自动更新一次
     industry_map = _load_or_refresh_industry_map(ak)
@@ -227,6 +243,24 @@ def fetch_live_signals(limit: int = 300, progress_callback: ProgressCallback | N
     if progress_callback:
         progress_callback(95, "数据处理完成，准备返回结果...")
     return result
+
+
+def _filter_by_market_scope(data: pd.DataFrame, market_scope: str) -> pd.DataFrame:
+    if "symbol_norm" not in data.columns:
+        return data
+    s = data["symbol_norm"].astype(str)
+    if market_scope == "all_a":
+        return data
+    if market_scope == "hs_main":
+        mask = s.str.match(r"^(600|601|603|605|000|001|002)\d{3}$")
+        return data[mask].copy()
+    if market_scope == "gem":
+        mask = s.str.match(r"^(300|301)\d{3}$")
+        return data[mask].copy()
+    if market_scope == "star":
+        mask = s.str.match(r"^688\d{3}$")
+        return data[mask].copy()
+    return data
 
 
 def _fetch_spot_with_proxy_strategy(ak_module) -> pd.DataFrame:
@@ -357,46 +391,169 @@ def _load_or_refresh_industry_map(ak_module) -> pd.Series:
         cached = cached.dropna(subset=["symbol", "theme"])
         if not cached.empty:
             cached["symbol"] = cached["symbol"].map(_normalize_symbol_code)
+            _write_industry_map_status("using_cached_industry_map")
             return cached.drop_duplicates("symbol").set_index("symbol")["theme"]
+        _write_industry_map_status("cached_industry_map_exists_but_empty")
     try:
         industry_map = _build_industry_map_from_ak(ak_module)
         if not industry_map.empty:
             df = industry_map.reset_index()
             df.columns = ["symbol", "theme"]
             df.to_csv(INDUSTRY_MAP_PATH, index=False, encoding="utf-8-sig")
+            _write_industry_map_status(f"built_industry_map_success rows={len(df)}")
             return industry_map
-    except Exception:
-        pass
+        _write_industry_map_status("build_industry_map_returned_empty")
+    except Exception as exc:
+        _write_industry_map_status(f"build_industry_map_exception: {repr(exc)}")
     # 返回空映射（上层按未知行业处理）
     return pd.Series(dtype=str)
 
 
 def _build_industry_map_from_ak(ak_module) -> pd.Series:
+    # 优先使用 tushare 提供的股票->行业映射
+    ts_map = _build_industry_map_from_tushare()
+    if not ts_map.empty:
+        return ts_map
+    # tushare 不可用时，回退同花顺行业链路
+    ths_map = _build_industry_map_from_ths(ak_module)
+    if not ths_map.empty:
+        return ths_map
+    return pd.Series(dtype=str)
+
+
+def _build_industry_map_from_tushare() -> pd.Series:
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        _write_industry_map_status("tushare_token_missing")
+        return pd.Series(dtype=str)
     try:
-        board_df = ak_module.stock_board_industry_name_em()
+        import tushare as ts
+    except Exception:
+        _write_industry_map_status("tushare_not_installed")
+        return pd.Series(dtype=str)
+
+    try:
+        pro = ts.pro_api(token)
+        df = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="symbol,industry",
+        )
     except Exception as exc:
-        raise RuntimeError(f"获取行业列表失败: {exc}") from exc
-    if board_df is None or board_df.empty or "板块名称" not in board_df.columns:
+        _write_industry_map_status(f"tushare_stock_basic_failed: {repr(exc)}")
+        return pd.Series(dtype=str)
+
+    if df is None or df.empty:
+        _write_industry_map_status("tushare_stock_basic_empty")
+        return pd.Series(dtype=str)
+
+    df = df.rename(columns={"symbol": "symbol", "industry": "theme"})
+    df["symbol"] = df["symbol"].astype(str).map(_normalize_symbol_code)
+    df["theme"] = df["theme"].astype(str).str.strip()
+    df = df[df["theme"].notna() & (df["theme"] != "") & (df["theme"].str.lower() != "nan")]
+    if df.empty:
+        _write_industry_map_status("tushare_stock_basic_no_valid_industry")
+        return pd.Series(dtype=str)
+    _write_industry_map_status(f"tushare_stock_basic_ok rows={len(df)}")
+    return df.drop_duplicates(subset=["symbol"], keep="first").set_index("symbol")["theme"]
+
+
+def _build_industry_map_from_ths(ak_module) -> pd.Series:
+    try:
+        board_df = ak_module.stock_board_industry_name_ths()
+    except Exception:
+        _write_industry_map_status("ths_industry_name_api_failed")
+        return pd.Series(dtype=str)
+    if board_df is None or board_df.empty:
+        _write_industry_map_status("ths_industry_name_empty")
+        return pd.Series(dtype=str)
+
+    board_col = _pick_col(board_df.columns, ["name", "名称", "板块名称"])
+    code_col = _pick_col(board_df.columns, ["code", "代码", "板块代码"])
+    if not board_col:
+        _write_industry_map_status("ths_industry_name_missing_name_column")
+        return pd.Series(dtype=str)
+    if not code_col:
+        _write_industry_map_status("ths_industry_name_missing_code_column")
         return pd.Series(dtype=str)
 
     mapping_rows: List[dict] = []
+    headers = {"User-Agent": "Mozilla/5.0"}
     for _, row in board_df.iterrows():
-        board_name = str(row["板块名称"])
-        try:
-            cons_df = ak_module.stock_board_industry_cons_em(symbol=board_name)
-        except Exception:
+        board_name = str(row[board_col])
+        board_code = str(row[code_col])
+        members = _fetch_ths_industry_members(board_code, headers=headers)
+        if not members:
             continue
-        if cons_df is None or cons_df.empty:
-            continue
-        symbol_col = _pick_col(cons_df.columns, ["代码", "股票代码"])
-        if not symbol_col:
-            continue
-        for sym in cons_df[symbol_col].astype(str):
+        for sym in members:
             mapping_rows.append({"symbol": _normalize_symbol_code(sym), "theme": board_name})
+
     if not mapping_rows:
+        _write_industry_map_status("ths_industry_members_empty")
         return pd.Series(dtype=str)
     map_df = pd.DataFrame(mapping_rows).drop_duplicates(subset=["symbol"], keep="first")
+    _write_industry_map_status(f"ths_industry_members_ok rows={len(map_df)}")
     return map_df.set_index("symbol")["theme"]
+
+
+def _fetch_ths_industry_members(board_code: str, headers: Dict[str, str]) -> List[str]:
+    import requests
+    from io import StringIO
+
+    symbols: List[str] = []
+    base_url = f"http://q.10jqka.com.cn/thshy/detail/code/{board_code}/"
+    try:
+        resp = requests.get(base_url, headers=headers, timeout=20)
+    except Exception:
+        _write_industry_map_status(f"ths_members_request_exception code={board_code}")
+        return symbols
+    if resp.status_code != 200:
+        _write_industry_map_status(f"ths_members_request_non_200 code={board_code} status={resp.status_code}")
+        return symbols
+    resp.encoding = "gbk"
+    total_pages = _extract_page_count(resp.text)
+    for page in range(1, total_pages + 1):
+        url = base_url if page == 1 else f"http://q.10jqka.com.cn/thshy/detail/code/{board_code}/page/{page}"
+        try:
+            page_resp = requests.get(url, headers=headers, timeout=20)
+            if page_resp.status_code != 200:
+                continue
+            page_resp.encoding = "gbk"
+            tables = pd.read_html(StringIO(page_resp.text))
+        except Exception:
+            continue
+        if not tables:
+            continue
+        table = tables[0]
+        if table.shape[1] < 3:
+            continue
+        # 同花顺页面表头受编码影响，取第2列作为代码列最稳
+        code_series = table.iloc[:, 1].astype(str).str.extract(r"(\d{6})", expand=False).dropna()
+        symbols.extend(code_series.tolist())
+    return list(dict.fromkeys(symbols))
+
+
+def _extract_page_count(html_text: str) -> int:
+    soup = BeautifulSoup(html_text, "lxml")
+    node = soup.find("span", attrs={"class": "page_info"})
+    if not node or not node.text:
+        return 1
+    m = re.search(r"/\s*(\d+)", node.text)
+    if not m:
+        return 1
+    try:
+        return max(1, int(m.group(1)))
+    except Exception:
+        return 1
+
+
+def _write_industry_map_status(message: str) -> None:
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        INDUSTRY_MAP_STATUS_PATH.write_text(f"[{ts}] {message}\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 def to_signal_objects(frame: pd.DataFrame) -> List[StockSignal]:
