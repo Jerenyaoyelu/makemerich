@@ -38,6 +38,9 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
     "industry_up_ratio": "行业上涨家数占比(%)",
     "snapshot_time": "快照时间",
     "source": "数据来源",
+    "theme_source": "行业来源",
+    "turnover_source": "换手来源",
+    "volume_ratio_source": "量比来源",
 }
 
 DISPLAY_COLUMN_ORDER: list[str] = [
@@ -59,6 +62,9 @@ DISPLAY_COLUMN_ORDER: list[str] = [
     "industry_up_ratio",
     "snapshot_time",
     "source",
+    "theme_source",
+    "turnover_source",
+    "volume_ratio_source",
 ]
 
 # 写入 CSV 仍为英文键；界面展示为中文说明
@@ -66,6 +72,13 @@ SOURCE_DISPLAY_LABELS: dict[str, str] = {
     "eastmoney_em": "东方财富（含换手、量比、振幅等，字段较全）",
     "sina_finance": "新浪财经（含换手；接口不含量比，表中显示「—」，打分中间量比按中性处理）",
     "stock_zh_a_spot": "新浪财经·旧版标识（换手/量比可能曾不准确，建议重新刷新数据）",
+}
+FIELD_SOURCE_LABELS: dict[str, str] = {
+    "spot": "实时源原始字段",
+    "industry_map_cache": "行业映射缓存回填",
+    "unknown": "未知",
+    "estimated_by_amount_nmc": "成交额/流通市值估算",
+    "missing": "缺失",
 }
 
 
@@ -213,6 +226,11 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
         out["数据来源"] = out["数据来源"].map(
             lambda x: SOURCE_DISPLAY_LABELS.get(str(x), str(x)) if pd.notna(x) else "—"
         )
+    for zh_col in ("行业来源", "换手来源", "量比来源"):
+        if zh_col in out.columns:
+            out[zh_col] = out[zh_col].map(
+                lambda x: FIELD_SOURCE_LABELS.get(str(x), str(x)) if pd.notna(x) else "—"
+            )
     for zh_col in ("换手率(%)", "量比"):
         if zh_col in out.columns:
             out[zh_col] = out[zh_col].map(_format_cell_missing_number)
@@ -224,6 +242,68 @@ def normalize_weights(w1: float, w2: float, w3: float, w4: float) -> tuple[float
     if total <= 0:
         return 0.25, 0.25, 0.25, 0.25
     return w1 / total, w2 / total, w3 / total, w4 / total
+
+
+def render_data_quality_panel(frame: pd.DataFrame) -> None:
+    total = len(frame)
+    if total == 0:
+        st.warning("当前无可用数据，无法生成数据质量诊断。")
+        return
+
+    def pct(expr: pd.Series) -> float:
+        return float(expr.mean() * 100)
+
+    theme_real = pct(frame.get("theme_source", pd.Series([], dtype=str)) == "spot")
+    theme_filled = pct(frame.get("theme_source", pd.Series([], dtype=str)) == "industry_map_cache")
+    theme_unknown = pct(frame.get("theme_source", pd.Series([], dtype=str)) == "unknown")
+
+    turnover_real = pct(frame.get("turnover_source", pd.Series([], dtype=str)) == "spot")
+    turnover_est = pct(frame.get("turnover_source", pd.Series([], dtype=str)) == "estimated_by_amount_nmc")
+    turnover_missing = pct(frame.get("turnover", pd.Series([], dtype=float)).isna())
+
+    vr_real = pct(frame.get("volume_ratio_source", pd.Series([], dtype=str)) == "spot")
+    vr_missing = pct(frame.get("volume_ratio", pd.Series([], dtype=float)).isna())
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("行业真实覆盖率", f"{theme_real:.1f}%")
+    c2.metric("换手真实覆盖率", f"{turnover_real:.1f}%")
+    c3.metric("量比真实覆盖率", f"{vr_real:.1f}%")
+
+    with st.expander("数据可用性诊断（评分可信度）", expanded=True):
+        st.markdown(
+            f"""
+            - **行业来源**：实时 `{theme_real:.1f}%` / 缓存回填 `{theme_filled:.1f}%` / 未知 `{theme_unknown:.1f}%`
+            - **换手来源**：实时 `{turnover_real:.1f}%` / 估算 `{turnover_est:.1f}%` / 缺失 `{turnover_missing:.1f}%`
+            - **量比来源**：实时 `{vr_real:.1f}%` / 缺失 `{vr_missing:.1f}%`
+            """
+        )
+
+        warnings: list[str] = []
+        if theme_unknown > 30:
+            warnings.append("行业未知占比偏高，题材强度/板块联动解释力下降。")
+        if turnover_est > 40:
+            warnings.append("换手估算占比偏高，资金承接因子稳定性下降。")
+        if vr_missing > 60:
+            warnings.append("量比缺失占比很高，个股强度/资金承接对量比依赖已被弱化。")
+
+        if warnings:
+            for msg in warnings:
+                st.warning(msg)
+        else:
+            st.success("当前字段覆盖率较好，评分可用性正常。")
+
+
+def build_review_template(filtered: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in ["symbol", "name", "theme", "total_score", "snapshot_time", "source"] if c in filtered.columns]
+    base = filtered[cols].copy()
+    base["next_day_open"] = pd.NA
+    base["next_day_close"] = pd.NA
+    base["next_day_high"] = pd.NA
+    base["next_day_low"] = pd.NA
+    base["next_day_close_pct_vs_today_close"] = pd.NA
+    base["hit_tag"] = ""
+    base["review_notes"] = ""
+    return base
 
 
 def main() -> None:
@@ -259,12 +339,19 @@ def main() -> None:
     )
 
     if refresh_btn:
+        progress = st.progress(0, text="准备刷新实时数据...")
         try:
-            live = fetch_live_signals(limit=refresh_limit)
+            live = fetch_live_signals(
+                limit=refresh_limit,
+                progress_callback=lambda p, msg: progress.progress(p, text=msg),
+            )
+            progress.progress(75, text="正在写入本地数据文件...")
             LIVE_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
             live.to_csv(LIVE_DATA_PATH, index=False, encoding="utf-8-sig")
+            progress.progress(100, text="实时数据刷新完成")
             st.success(f"自动采集完成：{LIVE_DATA_PATH}（{len(live)} 条）")
         except Exception as exc:
+            progress.empty()
             st.error(f"自动采集失败：{exc}")
             st.info("系统不会自动回退。你可以点击“手动加载本地缓存数据”或切换“样例数据（离线演示）”。")
 
@@ -276,30 +363,44 @@ def main() -> None:
             st.error(f"本地缓存文件不存在：{LIVE_DATA_PATH}")
 
     if run_btn:
+        progress = st.progress(0, text="准备运行筛选...")
         frame: pd.DataFrame
         if data_source == "自动采集（推荐）":
             force_local = st.session_state.get("force_local_file", False)
             if force_local:
                 if not LIVE_DATA_PATH.exists():
+                    progress.empty()
                     st.error(f"你选择了本地缓存数据，但文件不存在：{LIVE_DATA_PATH}")
                     return
+                progress.progress(30, text="正在加载本地缓存数据...")
                 frame = pd.read_csv(LIVE_DATA_PATH)
                 st.info("当前使用本地缓存数据（手动选择）。")
                 st.session_state["force_local_file"] = False
             else:
                 try:
-                    frame = fetch_live_signals(limit=refresh_limit)
+                    progress.progress(20, text="正在获取筛选输入数据...")
+                    frame = fetch_live_signals(
+                        limit=refresh_limit,
+                        progress_callback=lambda p, msg: progress.progress(p, text=f"筛选前数据准备：{msg}"),
+                    )
+                    progress.progress(60, text="正在写入缓存文件...")
                     LIVE_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
                     frame.to_csv(LIVE_DATA_PATH, index=False, encoding="utf-8-sig")
                 except Exception as exc:
+                    progress.empty()
                     st.error(f"实时采集失败：{exc}")
                     st.info("请先处理网络/代理问题，或点击“手动加载本地缓存数据”。")
                     return
         else:
+            progress.progress(30, text="正在加载样例数据...")
             frame = load_sample_signals(SAMPLE_DATA_PATH)
 
+        progress.progress(80, text="正在计算评分与筛选...")
         scored = score_frame(frame, w_theme, w_sector, w_stock, w_capital)
         filtered = scored[scored["total_score"] >= score_threshold].head(top_n)
+        progress.progress(100, text="筛选完成")
+
+        render_data_quality_panel(scored)
 
         st.subheader("候选股结果")
         st.dataframe(dataframe_for_display(filtered), use_container_width=True)
@@ -307,9 +408,13 @@ def main() -> None:
 
         if not filtered.empty:
             OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            out_path = OUTPUT_DIR / f"candidates_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = OUTPUT_DIR / f"candidates_{ts}.csv"
             filtered.to_csv(out_path, index=False, encoding="utf-8-sig")
+            review_path = OUTPUT_DIR / f"candidates_review_template_{ts}.csv"
+            build_review_template(filtered).to_csv(review_path, index=False, encoding="utf-8-sig")
             st.success(f"已导出结果：{out_path}")
+            st.info(f"已生成复评模板：{review_path}")
         else:
             st.warning("当前阈值下无入选标的，可尝试降低分数阈值。")
 
