@@ -31,8 +31,16 @@ logger = get_logger("ui.main")
 
 def main() -> None:
     logger.info("打开页面: 实时选股")
-    st.set_page_config(page_title="实时选股", page_icon="📈", layout="wide")
-    st.title("实时选股")
+    st.set_page_config(page_title="实时选股（执行页）", page_icon="📈", layout="wide")
+    if not st.session_state.get("_home_redirected_to_dashboard", False):
+        st.session_state["_home_redirected_to_dashboard"] = True
+        try:
+            st.switch_page("pages/0_系统驾驶舱.py")
+        except Exception:
+            # 旧版 Streamlit 不支持 switch_page 时继续显示执行页
+            pass
+
+    st.title("实时选股（执行页）")
     st.caption("最新行情快照 → 打分 → 候选池（与「历史回测 T0」互不混用）")
 
     st.info(
@@ -47,6 +55,11 @@ def main() -> None:
     w_def = defaults or {}
 
     with st.sidebar:
+        if st.button("前往系统驾驶舱（首页）"):
+            try:
+                st.switch_page("pages/0_系统驾驶舱.py")
+            except Exception:
+                st.info("当前环境不支持页面跳转，请在左侧导航手动切换到「系统驾驶舱」。")
         log_level = st.selectbox("日志级别", ["INFO", "DEBUG"], index=0)
         set_log_level(log_level)
         st.subheader("数据源（仅实时 / 样例）")

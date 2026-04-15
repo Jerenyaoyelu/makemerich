@@ -1,0 +1,24 @@
+[[pages]]
+path = "app/pages/0_系统驾驶舱.py"
+name = "系统驾驶舱（首页）"
+icon = "🧭"
+
+[[pages]]
+path = "app/main.py"
+name = "实时选股（执行页）"
+icon = "📈"
+
+[[pages]]
+path = "app/pages/3_历史回测_T0.py"
+name = "历史回测 T0"
+icon = "📅"
+
+[[pages]]
+path = "app/pages/1_复评中心.py"
+name = "复评中心"
+icon = "📊"
+
+[[pages]]
+path = "app/pages/2_参数实验室.py"
+name = "参数实验室"
+icon = "🧪"
