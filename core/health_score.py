@@ -11,10 +11,12 @@ def compute_health_score(
     source_used: str,
     degraded: bool,
     recent_collection_rate: float | None = None,
+    backtest_mode: bool = False,
 ) -> tuple[float, str, dict]:
     """
     返回 (0~100 分, 简短说明, 明细 dict)。
     degraded=True 表示未使用主源（东财）。
+    backtest_mode=True：历史截面回测，不按「快照是否今天」扣分，也不按实时采集成功率扣分。
     """
     details: dict = {
         "source_used": source_used,
@@ -51,33 +53,39 @@ def compute_health_score(
     if vr_ok < 0.3:
         details["deductions"].append("量比大量缺失")
 
-    # 新鲜度：快照日期为今天则满分，否则递减
-    freshness_pts = 25.0
-    try:
-        st = frame["snapshot_time"].iloc[0]
-        snap = pd.to_datetime(st)
-        now = datetime.now()
-        if snap.date() == now.date():
-            freshness_pts = 30.0
-        elif (now - snap.to_pydatetime()).days <= 1:
-            freshness_pts = 20.0
-        elif (now - snap.to_pydatetime()).days <= 3:
-            freshness_pts = 10.0
-        else:
-            freshness_pts = 5.0
-            details["deductions"].append("快照偏旧")
-    except Exception:
-        freshness_pts = 15.0
-        details["deductions"].append("无法解析快照时间")
-    details["freshness_pts"] = freshness_pts
+    if backtest_mode:
+        freshness_pts = 30.0
+        details["freshness_pts"] = freshness_pts
+        coll_pts = 20.0
+        details["collection_pts"] = coll_pts
+        details["mode"] = "historical_backtest"
+    else:
+        # 新鲜度：快照日期为今天则满分，否则递减
+        freshness_pts = 25.0
+        try:
+            st = frame["snapshot_time"].iloc[0]
+            snap = pd.to_datetime(st)
+            now = datetime.now()
+            if snap.date() == now.date():
+                freshness_pts = 30.0
+            elif (now - snap.to_pydatetime()).days <= 1:
+                freshness_pts = 20.0
+            elif (now - snap.to_pydatetime()).days <= 3:
+                freshness_pts = 10.0
+            else:
+                freshness_pts = 5.0
+                details["deductions"].append("快照偏旧")
+        except Exception:
+            freshness_pts = 15.0
+            details["deductions"].append("无法解析快照时间")
+        details["freshness_pts"] = freshness_pts
 
-    # 采集成功率（近 N 次）
-    coll_pts = 20.0
-    if recent_collection_rate is not None:
-        coll_pts = 20.0 * recent_collection_rate
-        if recent_collection_rate < 0.7:
-            details["deductions"].append("近期采集失败率偏高")
-    details["collection_pts"] = round(coll_pts, 2)
+        coll_pts = 20.0
+        if recent_collection_rate is not None:
+            coll_pts = 20.0 * recent_collection_rate
+            if recent_collection_rate < 0.7:
+                details["deductions"].append("近期采集失败率偏高")
+        details["collection_pts"] = round(coll_pts, 2)
 
     downgrade_penalty = 15.0 if degraded else 0.0
     if degraded:
@@ -85,5 +93,10 @@ def compute_health_score(
 
     raw = field_pts + freshness_pts + coll_pts - downgrade_penalty
     score = max(0.0, min(100.0, raw))
-    notes = "; ".join(details["deductions"]) if details["deductions"] else "字段与新鲜度正常"
+    if details["deductions"]:
+        notes = "; ".join(details["deductions"])
+    elif backtest_mode:
+        notes = "历史截面回测：未按实时快照/采集成功率扣分"
+    else:
+        notes = "字段与新鲜度正常"
     return round(score, 1), notes, details

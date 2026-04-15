@@ -159,6 +159,32 @@ def recent_collection_success_rate(last_n: int = 20) -> float | None:
         return None
 
 
+def resolve_auto_spot_preference(last_n: int = 20) -> str:
+    """
+    供「自动」主源策略使用：看近期成功采集里东财多还是新浪多。
+    返回 completeness_first（东财先试）或 stability_first（新浪先试）。
+    无数据或打平时默认 stability_first。
+    """
+    if not COLLECTION_HISTORY_CSV.exists():
+        return "stability_first"
+    try:
+        h = pd.read_csv(COLLECTION_HISTORY_CSV)
+        if h.empty:
+            return "stability_first"
+        tail = h.tail(last_n)
+        ok = tail[tail["success"].astype(bool)]
+        if ok.empty:
+            return "stability_first"
+        src = ok["source"].astype(str)
+        em = int((src == "eastmoney_em").sum())
+        sina = int((src == "sina_finance").sum())
+        if em > sina:
+            return "completeness_first"
+        return "stability_first"
+    except Exception:
+        return "stability_first"
+
+
 def append_strategy_report(row: dict[str, Any]) -> None:
     ensure_data_dirs()
     df = pd.DataFrame([row])

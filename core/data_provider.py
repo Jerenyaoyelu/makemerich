@@ -2,15 +2,20 @@ from __future__ import annotations
 
 from datetime import datetime
 import os
+import random
 import re
+import time
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List
+from typing import Callable, Dict, Iterable, List, TypeVar
+
 
 import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
 
+from core.logger import get_logger
 from core.models import StockSignal
+from core.run_store import resolve_auto_spot_preference
 
 REQUIRED_COLS = [
     "symbol",
@@ -26,6 +31,64 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 INDUSTRY_MAP_PATH = DATA_DIR / "industry_map.csv"
 INDUSTRY_MAP_STATUS_PATH = DATA_DIR / "industry_map_status.txt"
 ProgressCallback = Callable[[int, str], None]
+_T = TypeVar("_T")
+logger = get_logger("data_provider")
+
+_PROXY_ENV_KEYS = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+]
+
+
+def _ak_call_with_retries(
+    label: str,
+    fn: Callable[[], _T],
+    *,
+    max_attempts: int = 5,
+    base_sleep: float = 0.75,
+    clear_proxy_after_attempt: int = 2,
+) -> _T:
+    """
+    AkShare 底层走 HTTP，批量请求易被服务端掐断（RemoteDisconnected）。
+    策略：指数退避 + 若干次失败后临时清空系统代理再试（与实时东财逻辑一致）。
+    """
+    last_exc: BaseException | None = None
+    proxy_backup: dict[str, str | None] = {}
+    proxy_cleared = False
+    try:
+        for attempt in range(max_attempts):
+            try:
+                if attempt > 0:
+                    logger.info("%s: 第 %s 次重试", label, attempt + 1)
+                return fn()
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                logger.warning("%s 失败（attempt=%s/%s）: %s", label, attempt + 1, max_attempts, repr(exc))
+                if attempt >= clear_proxy_after_attempt and not proxy_cleared:
+                    proxy_backup = {k: os.environ.get(k) for k in _PROXY_ENV_KEYS}
+                    for k in _PROXY_ENV_KEYS:
+                        os.environ.pop(k, None)
+                    proxy_cleared = True
+                    logger.info("%s: 已临时清除代理环境变量后继续重试", label)
+                jitter = random.uniform(0.05, 0.35)
+                time.sleep(base_sleep * (1.55**attempt) + jitter)
+        msg = (
+            f"{label} 在 {max_attempts} 次重试后仍失败。"
+            "常见原因：网络不稳定、代理干扰、或东财/新浪限流。可尝试关闭系统代理、减小历史扫描上限、稍后重试。"
+        )
+        logger.error("%s", msg)
+        raise RuntimeError(msg) from last_exc
+    finally:
+        if proxy_cleared and proxy_backup:
+            for key, val in proxy_backup.items():
+                if val is not None:
+                    os.environ[key] = val
+            logger.info("%s: 已恢复代理环境变量", label)
+
 
 try:
     from dotenv import load_dotenv
@@ -47,6 +110,29 @@ def _normalize_symbol_code(symbol: object) -> str:
     if s.startswith(("sh", "sz", "bj")):
         s = s[2:]
     return s
+
+
+def _format_symbol_for_hist(symbol: str) -> str:
+    """与 `core.evaluation.format_symbol_for_ak` 一致，供 AkShare 日线接口使用。"""
+    s = str(symbol).strip().zfill(6)
+    if s.startswith(("6", "9")):
+        return f"sh{s}"
+    if s.startswith(("8", "4")):
+        return f"bj{s}"
+    return f"sz{s}"
+
+
+def _symbol_in_market_scope(symbol_norm: str, market_scope: str) -> bool:
+    s = str(symbol_norm)
+    if market_scope == "all_a":
+        return True
+    if market_scope == "hs_main":
+        return bool(re.match(r"^(600|601|603|605|000|001|002)\d{3}$", s))
+    if market_scope == "gem":
+        return bool(re.match(r"^(300|301)\d{3}$", s))
+    if market_scope == "star":
+        return bool(re.match(r"^688\d{3}$", s))
+    return True
 
 
 def _normalize_0_100(series: pd.Series) -> pd.Series:
@@ -86,7 +172,22 @@ def fetch_live_signals(
     limit: int = 300,
     progress_callback: ProgressCallback | None = None,
     market_scope: str = "all_a",
+    primary_source_strategy: str = "stability_first",
 ) -> pd.DataFrame:
+    eff = (
+        resolve_auto_spot_preference()
+        if primary_source_strategy == "auto"
+        else primary_source_strategy
+    )
+    if eff not in ("completeness_first", "stability_first"):
+        eff = "stability_first"
+    logger.info(
+        "开始实时采集: limit=%s, market_scope=%s, primary_strategy=%s (effective=%s)",
+        limit,
+        market_scope,
+        primary_source_strategy,
+        eff,
+    )
     try:
         import akshare as ak
     except Exception as exc:
@@ -94,11 +195,14 @@ def fetch_live_signals(
 
     if progress_callback:
         progress_callback(5, "准备连接数据源...")
-    spot, source = _fetch_spot_multi_source(ak, progress_callback=progress_callback)
+    spot, source = _fetch_spot_multi_source(
+        ak, progress_callback=progress_callback, primary_strategy=eff
+    )
     if spot is None or spot.empty:
         raise RuntimeError("未获取到实时行情数据。")
     if progress_callback:
         progress_callback(40, f"数据源 {source} 已返回，正在清洗与补齐字段...")
+    logger.info("实时采集源=%s, rows=%s", source, 0 if spot is None else len(spot))
 
     colmap: Dict[str, str | None] = {
         "symbol": _pick_col(spot.columns, ["代码"]),
@@ -163,8 +267,36 @@ def fetch_live_signals(
     if data.empty:
         raise RuntimeError("按当前采集范围过滤后无可用股票，请调整采集范围。")
 
-    # 行业回填：优先读取本地行业映射缓存；若不存在则尝试自动更新一次
-    industry_map = _load_or_refresh_industry_map(ak)
+    nmc_col = _pick_col(spot.columns, ["流通市值", "nmc"])
+    if nmc_col:
+        nmc_series = pd.to_numeric(spot[nmc_col], errors="coerce").replace(0, np.nan)
+        data["float_mktcap"] = nmc_series.reindex(data.index)
+    else:
+        data["float_mktcap"] = np.nan
+
+    result = _finalize_signals_from_base_data(
+        data,
+        source=source,
+        snapshot_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        limit=limit,
+        ak_module=ak,
+        progress_callback=progress_callback,
+    )
+    logger.info("实时采集完成: source=%s, result_rows=%s", source, len(result))
+    return result
+
+
+def _finalize_signals_from_base_data(
+    data: pd.DataFrame,
+    *,
+    source: str,
+    snapshot_time: str,
+    limit: int,
+    ak_module,
+    progress_callback: ProgressCallback | None = None,
+) -> pd.DataFrame:
+    """由「已清洗的当日行情宽表」计算行业聚合、四因子与输出列（实时/历史共用）。"""
+    industry_map = _load_or_refresh_industry_map(ak_module)
     if not industry_map.empty:
         missing_theme_mask = (data["theme"].isin(["未知行业", "", "None"])) | data["theme"].isna()
         filled_theme = data.loc[missing_theme_mask, "symbol_norm"].map(industry_map)
@@ -174,22 +306,15 @@ def fetch_live_signals(
             data.loc[idx, "theme"] = filled_theme.loc[idx]
             data.loc[idx, "theme_source"] = "industry_map_cache"
 
-    # 换手率回填：用成交额/流通市值估算
-    nmc_col = _pick_col(spot.columns, ["流通市值", "nmc"])
-    if nmc_col:
-        nmc_series = pd.to_numeric(spot[nmc_col], errors="coerce").replace(0, np.nan)
-        # data 已经过滤，索引不连续；必须按索引对齐，不能直接塞全量 values
-        data["float_mktcap"] = nmc_series.reindex(data.index)
-        need_turnover_est = data["turnover"].isna() | (data["turnover"] <= 0)
-        est_turnover = (data["amount"] / data["float_mktcap"] * 100).replace([np.inf, -np.inf], np.nan)
-        est_ok = need_turnover_est & est_turnover.notna()
-        if est_ok.any():
-            data.loc[est_ok, "turnover"] = est_turnover.loc[est_ok]
-            data.loc[est_ok, "turnover_source"] = "estimated_by_amount_nmc"
-    else:
+    if "float_mktcap" not in data.columns:
         data["float_mktcap"] = np.nan
+    need_turnover_est = data["turnover"].isna() | (data["turnover"] <= 0)
+    est_turnover = (data["amount"] / data["float_mktcap"] * 100).replace([np.inf, -np.inf], np.nan)
+    est_ok = need_turnover_est & est_turnover.notna() & data["float_mktcap"].notna()
+    if est_ok.any():
+        data.loc[est_ok, "turnover"] = est_turnover.loc[est_ok]
+        data.loc[est_ok, "turnover_source"] = "estimated_by_amount_nmc"
 
-    # 量比缺失保持缺失；只在打分中中性处理，同时记录来源
     data.loc[data["volume_ratio"].isna(), "volume_ratio_source"] = "missing"
 
     industry_stats = data.groupby("theme").agg(
@@ -199,7 +324,6 @@ def fetch_live_signals(
     )
     data = data.join(industry_stats, on="theme")
 
-    # 量比缺失时用1.0作为中性占位；并降低量比系数权重，避免虚假量比污染排序
     vol_for_score = data["volume_ratio"].fillna(1.0)
     vol_available = data["volume_ratio"].notna().astype(float)
     vol_coef_stock = 22 * (0.3 + 0.7 * vol_available)
@@ -219,7 +343,7 @@ def fetch_live_signals(
         data["turnover"].fillna(0.0) * 0.35 + np.log1p(data["amount"]) * 6 + vol_for_score * vol_coef_capital
     )
     data["risk_tag"] = _build_risk_tag(data["amplitude"], turn_for_risk)
-    data["snapshot_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data["snapshot_time"] = snapshot_time
     data["source"] = source
     if progress_callback:
         progress_callback(85, "正在计算评分因子...")
@@ -242,6 +366,349 @@ def fetch_live_signals(
     result = result.sort_values(by="stock_strength", ascending=False).head(limit).reset_index(drop=True)
     if progress_callback:
         progress_callback(95, "数据处理完成，准备返回结果...")
+    return result
+
+
+def _extract_hist_row_for_trade_date(
+    hist: pd.DataFrame,
+    *,
+    target_date_ymd: str,
+) -> pd.Series | None:
+    """从任意源返回的日线表中抽取目标交易日一行。"""
+    if hist is None or hist.empty:
+        return None
+    date_col = _pick_col(hist.columns, ["日期", "date", "Date", "交易日期"])
+    if date_col:
+        d = pd.to_datetime(hist[date_col], errors="coerce").dt.strftime("%Y%m%d")
+        hit = hist[d == target_date_ymd]
+        if hit.empty:
+            return None
+        return hit.iloc[-1]
+    # 无日期列时退化为最后一行（极少见）
+    return hist.iloc[-1]
+
+
+def _pick_first_numeric(row: pd.Series, candidates: list[str]) -> float | None:
+    for c in candidates:
+        if c in row.index:
+            v = pd.to_numeric(row.get(c), errors="coerce")
+            if pd.notna(v):
+                return float(v)
+    return None
+
+
+def _hist_try_em(
+    ak_module,
+    symbol_prefixed: str,
+    target_date_ymd: str,
+    request_delay_sec: float,
+) -> tuple[dict | None, str | None]:
+    try:
+        hist_em = _ak_call_with_retries(
+            f"日线(东财) {symbol_prefixed} {target_date_ymd}",
+            lambda s=symbol_prefixed: ak_module.stock_zh_a_hist(
+                symbol=s,
+                period="daily",
+                start_date=target_date_ymd,
+                end_date=target_date_ymd,
+                adjust="qfq",
+            ),
+            max_attempts=4,
+            base_sleep=0.55,
+            clear_proxy_after_attempt=1,
+        )
+        if request_delay_sec > 0:
+            time.sleep(request_delay_sec)
+        row = _extract_hist_row_for_trade_date(hist_em, target_date_ymd=target_date_ymd)
+        if row is not None:
+            return {
+                "pct_chg": _pick_first_numeric(row, ["涨跌幅"]),
+                "amount": _pick_first_numeric(row, ["成交额"]),
+                "turnover": _pick_first_numeric(row, ["换手率"]),
+                "amplitude": _pick_first_numeric(row, ["振幅"]),
+            }, "em"
+    except RuntimeError:
+        pass
+    return None, None
+
+
+def _hist_try_sina(
+    ak_module,
+    symbol_prefixed: str,
+    target_date_ymd: str,
+    request_delay_sec: float,
+) -> tuple[dict | None, str | None]:
+    try:
+        hist_sina = _ak_call_with_retries(
+            f"日线(新浪) {symbol_prefixed} {target_date_ymd}",
+            lambda s=symbol_prefixed: ak_module.stock_zh_a_daily(
+                symbol=s,
+                start_date=target_date_ymd,
+                end_date=target_date_ymd,
+                adjust="qfq",
+            ),
+            max_attempts=3,
+            base_sleep=0.6,
+            clear_proxy_after_attempt=1,
+        )
+        if request_delay_sec > 0:
+            time.sleep(request_delay_sec)
+        row = _extract_hist_row_for_trade_date(hist_sina, target_date_ymd=target_date_ymd)
+        if row is not None:
+            close_v = _pick_first_numeric(row, ["close", "收盘"])
+            open_v = _pick_first_numeric(row, ["open", "开盘"])
+            high_v = _pick_first_numeric(row, ["high", "最高"])
+            low_v = _pick_first_numeric(row, ["low", "最低"])
+            pct_v = _pick_first_numeric(row, ["涨跌幅", "changepercent"])
+            if pct_v is None and close_v is not None and open_v is not None and open_v != 0:
+                pct_v = (close_v / open_v - 1.0) * 100.0
+            amp_v = _pick_first_numeric(row, ["振幅", "amplitude"])
+            if amp_v is None and high_v is not None and low_v is not None and close_v and close_v != 0:
+                amp_v = abs(high_v - low_v) / close_v * 100.0
+            return {
+                "pct_chg": pct_v,
+                "amount": _pick_first_numeric(row, ["amount", "成交额"]),
+                "turnover": _pick_first_numeric(row, ["turnover", "换手率"]),
+                "amplitude": amp_v,
+            }, "sina"
+    except RuntimeError:
+        pass
+    return None, None
+
+
+def _hist_try_tx(
+    ak_module,
+    symbol_prefixed: str,
+    target_date_ymd: str,
+    request_delay_sec: float,
+) -> tuple[dict | None, str | None]:
+    target_date_iso = f"{target_date_ymd[:4]}-{target_date_ymd[4:6]}-{target_date_ymd[6:8]}"
+    try:
+        hist_tx = _ak_call_with_retries(
+            f"日线(腾讯) {symbol_prefixed} {target_date_ymd}",
+            lambda s=symbol_prefixed: ak_module.stock_zh_a_hist_tx(
+                symbol=s,
+                start_date=target_date_iso,
+                end_date=target_date_iso,
+                adjust="qfq",
+            ),
+            max_attempts=3,
+            base_sleep=0.65,
+            clear_proxy_after_attempt=1,
+        )
+        if request_delay_sec > 0:
+            time.sleep(request_delay_sec)
+        row = _extract_hist_row_for_trade_date(hist_tx, target_date_ymd=target_date_ymd)
+        if row is not None:
+            close_v = _pick_first_numeric(row, ["收盘", "close"])
+            open_v = _pick_first_numeric(row, ["开盘", "open"])
+            high_v = _pick_first_numeric(row, ["最高", "high"])
+            low_v = _pick_first_numeric(row, ["最低", "low"])
+            pct_v = _pick_first_numeric(row, ["涨跌幅"])
+            if pct_v is None and close_v is not None and open_v is not None and open_v != 0:
+                pct_v = (close_v / open_v - 1.0) * 100.0
+            amp_v = _pick_first_numeric(row, ["振幅"])
+            if amp_v is None and high_v is not None and low_v is not None and close_v and close_v != 0:
+                amp_v = abs(high_v - low_v) / close_v * 100.0
+            return {
+                "pct_chg": pct_v,
+                "amount": _pick_first_numeric(row, ["成交额", "amount"]),
+                "turnover": _pick_first_numeric(row, ["换手率", "turnover"]),
+                "amplitude": amp_v,
+            }, "tx"
+    except RuntimeError:
+        pass
+    return None, None
+
+
+def _fetch_hist_row_multi_source(
+    ak_module,
+    *,
+    code6: str,
+    symbol_prefixed: str,
+    target_date_ymd: str,
+    request_delay_sec: float,
+    primary_strategy: str = "stability_first",
+) -> tuple[dict | None, str | None]:
+    """
+    历史单票多源，顺序由 primary_strategy 决定：
+    - stability_first: 新浪 -> 腾讯 -> 东财
+    - completeness_first: 东财 -> 新浪 -> 腾讯
+    """
+    if primary_strategy == "completeness_first":
+        order = ("em", "sina", "tx")
+    else:
+        order = ("sina", "tx", "em")
+
+    for src in order:
+        if src == "em":
+            d, tag = _hist_try_em(ak_module, symbol_prefixed, target_date_ymd, request_delay_sec)
+        elif src == "sina":
+            d, tag = _hist_try_sina(ak_module, symbol_prefixed, target_date_ymd, request_delay_sec)
+        else:
+            d, tag = _hist_try_tx(ak_module, symbol_prefixed, target_date_ymd, request_delay_sec)
+        if d is not None:
+            return d, tag
+    return None, None
+
+
+def fetch_historical_signals(
+    trade_date: str,
+    limit: int = 300,
+    progress_callback: ProgressCallback | None = None,
+    market_scope: str = "all_a",
+    max_universe_scan: int = 3500,
+    request_delay_sec: float = 0.08,
+    primary_source_strategy: str = "stability_first",
+) -> pd.DataFrame:
+    """
+    按**某一交易日**的 AkShare 后复权日线，重建当日全市场截面并走与实时相同的因子流水线。
+    `snapshot_time` 固定为该日 15:00:00，便于复评脚本以该日为 T0 计算 T+1、T+2…
+
+    说明：日线不含「量比」，与新浪备源一致按缺失处理；行业依赖本地映射缓存回填。
+    扫描上限用于控制请求条数（逐票 `stock_zh_a_hist`），过大较慢。
+    `request_delay_sec`：每笔日线请求后的间隔，降低被服务端掐断（RemoteDisconnected）的概率。
+    `primary_source_strategy`：与实时采集相同，`auto` 依据近期成功采集记录选择先试东财或新浪。
+    """
+    eff = (
+        resolve_auto_spot_preference()
+        if primary_source_strategy == "auto"
+        else primary_source_strategy
+    )
+    if eff not in ("completeness_first", "stability_first"):
+        eff = "stability_first"
+    logger.info(
+        "开始历史截面采集: trade_date=%s, scope=%s, limit=%s, scan_cap=%s, delay=%.2f, primary=%s (effective=%s)",
+        trade_date,
+        market_scope,
+        limit,
+        max_universe_scan,
+        request_delay_sec,
+        primary_source_strategy,
+        eff,
+    )
+    try:
+        import akshare as ak
+    except Exception as exc:
+        raise RuntimeError("未安装 akshare，无法拉取历史数据。请先执行 pip install -r requirements.txt") from exc
+
+    d = pd.to_datetime(trade_date).strftime("%Y-%m-%d")
+    ymd = d.replace("-", "")
+    if progress_callback:
+        progress_callback(
+            3,
+            f"准备拉取历史截面：{d}（逐票日线，已启用重试/节流；若仍失败请关代理或减小扫描上限）…",
+        )
+
+    info = _ak_call_with_retries(
+        "获取 A 股代码表 stock_info_a_code_name",
+        lambda: ak.stock_info_a_code_name(),
+        max_attempts=6,
+        base_sleep=1.0,
+        clear_proxy_after_attempt=2,
+    )
+    if info is None or info.empty:
+        raise RuntimeError("无法获取 A 股代码表 stock_info_a_code_name。")
+    logger.info("历史采集代码表获取成功: total_codes=%s", len(info))
+
+    code_col = _pick_col(info.columns, ["code", "代码"])
+    name_col = _pick_col(info.columns, ["name", "名称"])
+    if not code_col or not name_col:
+        raise RuntimeError(f"A 股代码表缺少 code/name 列: {list(info.columns)}")
+
+    rows: List[dict] = []
+    source_hit = {"em": 0, "sina": 0, "tx": 0, "none": 0}
+    scanned = 0
+    for _, info_row in info.iterrows():
+        code_raw = str(info_row[code_col]).strip()
+        if not code_raw.replace(".", "").isdigit():
+            continue
+        code = code_raw.split(".")[0].zfill(6)
+        name = str(info_row[name_col])
+        if "ST" in name.upper():
+            continue
+        sym_norm = _normalize_symbol_code(code)
+        if not _symbol_in_market_scope(sym_norm, market_scope):
+            continue
+        if scanned >= max_universe_scan:
+            break
+        scanned += 1
+
+        sym = _format_symbol_for_hist(code)
+        unified, hit_source = _fetch_hist_row_multi_source(
+            ak,
+            code6=code,
+            symbol_prefixed=sym,
+            target_date_ymd=ymd,
+            request_delay_sec=request_delay_sec,
+            primary_strategy=eff,
+        )
+        if unified is None:
+            source_hit["none"] += 1
+            continue
+        source_hit[hit_source or "none"] += 1
+
+        pct = unified.get("pct_chg")
+        amt = unified.get("amount")
+        if amt is None or pd.isna(amt) or float(amt) <= 0:
+            continue
+        turn = unified.get("turnover")
+        amp = unified.get("amplitude")
+        if amp is None or pd.isna(amp):
+            amp = 0.0
+        if pct is None or pd.isna(pct):
+            pct = 0.0
+
+        ts = "spot" if turn is not None and pd.notna(turn) and float(turn) > 0 else "missing"
+        rows.append(
+            {
+                "symbol": code,
+                "symbol_norm": sym_norm,
+                "name": name,
+                "theme": "未知行业",
+                "theme_source": "unknown",
+                "pct_chg": float(pct),
+                "amount": float(amt),
+                "turnover": float(turn) if turn is not None and pd.notna(turn) else np.nan,
+                "turnover_source": ts,
+                "volume_ratio": np.nan,
+                "volume_ratio_source": "missing",
+                "amplitude": float(amp),
+            }
+        )
+
+        if progress_callback and scanned % 20 == 0:
+            p = min(75, 5 + int(70 * scanned / max(1, max_universe_scan)))
+            progress_callback(
+                p,
+                f"历史日线请求进度 {scanned}/{max_universe_scan}，已入库 {len(rows)} 只有效标的…",
+            )
+            logger.info(
+                "历史采集进度: scanned=%s/%s, collected=%s, hits=%s",
+                scanned,
+                max_universe_scan,
+                len(rows),
+                source_hit,
+            )
+
+    if not rows:
+        raise RuntimeError(
+            f"交易日 {d} 未采到有效日线数据。请确认当日为交易日、网络正常，或提高「历史扫描上限」。"
+        )
+    logger.info("历史采集原始数据完成: collected_rows=%s, source_hits=%s", len(rows), source_hit)
+
+    data = pd.DataFrame(rows)
+    data["float_mktcap"] = np.nan
+    snap = f"{d} 15:00:00"
+    result = _finalize_signals_from_base_data(
+        data,
+        source="historical_daily_multi",
+        snapshot_time=snap,
+        limit=limit,
+        ak_module=ak,
+        progress_callback=progress_callback,
+    )
+    logger.info("历史截面构建完成: trade_date=%s, result_rows=%s", d, len(result))
     return result
 
 
@@ -290,30 +757,57 @@ def _fetch_spot_with_proxy_strategy(ak_module) -> pd.DataFrame:
 
 
 def _fetch_spot_multi_source(
-    ak_module, progress_callback: ProgressCallback | None = None
+    ak_module,
+    progress_callback: ProgressCallback | None = None,
+    *,
+    primary_strategy: str = "stability_first",
 ) -> tuple[pd.DataFrame, str]:
-    primary_error: Exception | None = None
-    fallback_error: Exception | None = None
-    try:
+    """
+    primary_strategy:
+    - stability_first: 新浪分页 -> 东财
+    - completeness_first: 东财 -> 新浪分页
+    """
+    first_error: Exception | None = None
+    second_error: Exception | None = None
+
+    def _try_sina() -> tuple[pd.DataFrame, str]:
+        if progress_callback:
+            progress_callback(12, "尝试主源：新浪财经（分页采集）...")
+        return _fetch_sina_zh_a_spot_with_turnover(progress_callback=progress_callback), "sina_finance"
+
+    def _try_em() -> tuple[pd.DataFrame, str]:
         if progress_callback:
             progress_callback(12, "尝试主源：东方财富...")
         return _fetch_spot_with_proxy_strategy(ak_module), "eastmoney_em"
-    except Exception as exc:  # noqa: BLE001
-        primary_error = exc
 
-    try:
-        if progress_callback:
-            progress_callback(18, "主源失败，切换备源：新浪财经（分页采集）...")
-        # akshare 的 stock_zh_a_spot会丢弃新浪返回的 turnoverratio，导致换手恒为 0
-        return _fetch_sina_zh_a_spot_with_turnover(progress_callback=progress_callback), "sina_finance"
-    except Exception as exc:  # noqa: BLE001
-        fallback_error = exc
+    if primary_strategy == "completeness_first":
+        try:
+            return _try_em()
+        except Exception as exc:  # noqa: BLE001
+            first_error = exc
+        try:
+            if progress_callback:
+                progress_callback(18, "东财失败，切换备源：新浪财经（分页采集）...")
+            return _try_sina()
+        except Exception as exc:  # noqa: BLE001
+            second_error = exc
+    else:
+        try:
+            return _try_sina()
+        except Exception as exc:  # noqa: BLE001
+            first_error = exc
+        try:
+            if progress_callback:
+                progress_callback(18, "新浪失败，切换备源：东方财富...")
+            return _try_em()
+        except Exception as exc:  # noqa: BLE001
+            second_error = exc
 
     raise RuntimeError(
-        "实时采集失败：主源与备源均不可用。"
-        f"\n主源 stock_zh_a_spot_em 错误: {primary_error}"
-        f"\n备源新浪财经错误: {fallback_error}"
-    ) from fallback_error
+        "实时采集失败：两个行情源均不可用。"
+        f"\n第一次尝试错误: {first_error}"
+        f"\n第二次尝试错误: {second_error}"
+    ) from second_error
 
 
 def _get_sina_a_page_count() -> int:

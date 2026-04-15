@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from pathlib import Path
+import time
 import pandas as pd
 
 HORIZONS = (1, 2, 3, 5, 10)
 
 
 def format_symbol_for_ak(symbol: str) -> str:
-    s = str(symbol).strip()
+    """
+    `stock_zh_a_hist` 使用 6 位代码（如 000001），
+    不使用 sz/sh/bj 前缀。
+    """
+    s = str(symbol).strip().lower()
     if s.startswith(("sh", "sz", "bj")):
-        return s
-    if s.startswith(("6", "9")):
-        return f"sh{s}"
-    if s.startswith(("8", "4")):
-        return f"bj{s}"
-    return f"sz{s}"
+        s = s[2:]
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return str(symbol).strip()
+    return digits[-6:].zfill(6)
 
 
 def _snapshot_ymd(snapshot_time: str) -> str:
@@ -66,6 +71,87 @@ def _row_metrics(
     return round(mdd, 4), round(mru, 4)
 
 
+def _prefixed_symbol(code6: str) -> str:
+    if code6.startswith(("6", "9")):
+        return f"sh{code6}"
+    if code6.startswith(("8", "4")):
+        return f"bj{code6}"
+    return f"sz{code6}"
+
+
+def _normalize_hist_df(hist: pd.DataFrame) -> pd.DataFrame | None:
+    if hist is None or hist.empty:
+        return None
+    h = hist.copy()
+    col_date = "日期" if "日期" in h.columns else ("date" if "date" in h.columns else None)
+    col_close = "收盘" if "收盘" in h.columns else ("close" if "close" in h.columns else None)
+    col_high = "最高" if "最高" in h.columns else ("high" if "high" in h.columns else None)
+    col_low = "最低" if "最低" in h.columns else ("low" if "low" in h.columns else None)
+    if not col_date or not col_close or not col_high or not col_low:
+        return None
+    return pd.DataFrame(
+        {
+            "日期": pd.to_datetime(h[col_date], errors="coerce"),
+            "收盘": pd.to_numeric(h[col_close], errors="coerce"),
+            "最高": pd.to_numeric(h[col_high], errors="coerce"),
+            "最低": pd.to_numeric(h[col_low], errors="coerce"),
+        }
+    ).dropna(subset=["日期"])
+
+
+def _fetch_hist_window_multi_source(
+    ak_module,
+    *,
+    code6: str,
+    start_ymd: str,
+    end_ymd: str,
+) -> pd.DataFrame | None:
+    proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]
+
+    def _run_with_retries(fn, max_attempts: int = 3) -> pd.DataFrame | None:
+        backup = {k: os.environ.get(k) for k in proxy_keys}
+        last_err: Exception | None = None
+        try:
+            for i in range(max_attempts):
+                try:
+                    if i >= 1:
+                        for key in proxy_keys:
+                            os.environ.pop(key, None)
+                    return fn()
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    time.sleep(0.35 * (i + 1))
+            if last_err:
+                raise last_err
+            return None
+        finally:
+            for key in proxy_keys:
+                os.environ.pop(key, None)
+            for key, val in backup.items():
+                if val is not None:
+                    os.environ[key] = val
+
+    pref = _prefixed_symbol(code6)
+    start_iso = f"{start_ymd[:4]}-{start_ymd[4:6]}-{start_ymd[6:8]}"
+    end_iso = f"{end_ymd[:4]}-{end_ymd[4:6]}-{end_ymd[6:8]}"
+    fetchers = (
+        lambda: ak_module.stock_zh_a_hist(
+            symbol=code6, period="daily", start_date=start_ymd, end_date=end_ymd, adjust="qfq"
+        ),
+        lambda: ak_module.stock_zh_a_daily(symbol=pref, start_date=start_ymd, end_date=end_ymd, adjust="qfq"),
+        lambda: ak_module.stock_zh_a_hist_tx(symbol=pref, start_date=start_iso, end_date=end_iso, adjust="qfq"),
+    )
+    for fn in fetchers:
+        try:
+            hist = _run_with_retries(fn)
+            norm = _normalize_hist_df(hist) if hist is not None else None
+            if norm is not None and not norm.empty:
+                return norm
+        except Exception:
+            continue
+    return None
+
+
 def evaluate_multi_horizon(
     df: pd.DataFrame,
     *,
@@ -100,20 +186,14 @@ def evaluate_multi_horizon(
         symbol = format_symbol_for_ak(row["symbol"])
         snap = str(row["snapshot_time"])
         snapshot_date = _snapshot_ymd(snap)
-
-        try:
-            hist = ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=snapshot_date,
-                end_date=end_date,
-                adjust="qfq",
-            )
-        except Exception:
-            out.at[idx, "status"] = "数据不足"
-            continue
+        hist = _fetch_hist_window_multi_source(
+            ak,
+            code6=symbol,
+            start_ymd=snapshot_date,
+            end_ymd=end_date,
+        )
         if hist is None or hist.empty:
-            out.at[idx, "status"] = "数据不足"
+            out.at[idx, "status"] = "拉取失败"
             continue
 
         t0, _ = _kth_trading_row_after(hist, snapshot_date, 1)

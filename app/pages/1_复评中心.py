@@ -28,6 +28,41 @@ DISPLAY_RET = [
 ]
 
 
+def _display_name(col: str) -> str:
+    base_map = {
+        "symbol": "代码",
+        "name": "名称",
+        "total_score": "综合得分",
+        "status": "状态",
+        "ret_close_t1": "T+1 收盘收益%",
+        "ret_close_t2": "T+2 收盘收益%",
+        "ret_close_t3": "T+3 收盘收益%",
+        "ret_close_t5": "T+5 收盘收益%",
+        "ret_close_t10": "T+10 收盘收益%",
+        "hit_stop_loss": "是否触发止损",
+        "hit_take_profit": "是否触发止盈",
+        "n": "样本数",
+        "mean_ret": "平均收益%",
+        "median_ret": "中位收益%",
+        "win_rate": "胜率",
+        "profit_factor_approx": "近似盈亏比",
+        "layer": "分层",
+    }
+    if col in base_map:
+        return base_map[col]
+    if col.startswith("max_drawdown_t"):
+        n = col.split("t")[-1]
+        return f"T+{n} 最大回撤%"
+    if col.startswith("max_runup_t"):
+        n = col.split("t")[-1]
+        return f"T+{n} 最大冲高%"
+    return col
+
+
+def _rename_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    return df.rename(columns={c: _display_name(c) for c in df.columns})
+
+
 def _run_needs_eval(run_id: str) -> bool:
     ev = load_run_evaluation(run_id)
     if ev is None or ev.empty:
@@ -52,7 +87,8 @@ choice = st.selectbox("选择 run_id", run_ids, index=len(run_ids) - 1)
 row = runs_df[runs_df["run_id"] == choice].iloc[0]
 st.write(
     f"创建时间：**{row.get('created_at', '')}** ｜ 候选数：**{row.get('candidate_count', '')}** ｜ "
-    f"当时健康分：**{row.get('health_score', '')}** ｜ 源：**{row.get('source_used', '')}**"
+    f"当时健康分：**{row.get('health_score', '')}** ｜ 源：**{row.get('source_used', '')}** ｜ "
+    f"类型：**{row.get('data_source', '')}**"
 )
 
 c1, c2, c3 = st.columns(3)
@@ -77,6 +113,10 @@ if do_eval:
             result.to_csv(out_p, index=False, encoding="utf-8-sig")
             bar.empty()
             st.success(f"已写入：{out_p}")
+            if "ret_close_t1" in result.columns:
+                t1_valid = int(pd.to_numeric(result["ret_close_t1"], errors="coerce").notna().sum())
+                if t1_valid == 0:
+                    st.warning("当前 run 还没有可用的 T+1 收盘数据。若是今日/近两日 run，请等待后续交易日再更新复评。")
             summ = portfolio_summary(result, "ret_close_t1")
             if summ:
                 append_strategy_report(
@@ -127,7 +167,7 @@ if "hit_stop_loss" in ev_df.columns:
 if "hit_take_profit" in ev_df.columns:
     show_cols.append("hit_take_profit")
 show_cols = [c for c in show_cols if c in ev_df.columns]
-st.dataframe(ev_df[show_cols], use_container_width=True)
+st.dataframe(_rename_for_display(ev_df[show_cols]), use_container_width=True)
 
 st.subheader("组合统计（等权看待选列表）")
 cols_m = []
@@ -139,7 +179,7 @@ for col, lab in DISPLAY_RET:
 
 if cols_m:
     pm = pd.DataFrame(cols_m)
-    st.dataframe(pm, use_container_width=True)
+    st.dataframe(_rename_for_display(pm), use_container_width=True)
 
 st.subheader("分层表现（按综合得分排序）")
 for col, lab in DISPLAY_RET:
@@ -148,4 +188,4 @@ for col, lab in DISPLAY_RET:
     ls = layer_summary(ev_df, ret_col=col)
     if not ls.empty:
         st.markdown(f"**{lab}**")
-        st.dataframe(ls, use_container_width=True)
+        st.dataframe(_rename_for_display(ls), use_container_width=True)
