@@ -39,8 +39,26 @@ def _display_name(col: str) -> str:
         "ret_close_t3": "T+3 收盘收益%",
         "ret_close_t5": "T+5 收盘收益%",
         "ret_close_t10": "T+10 收盘收益%",
+        "ret_close_t1_net": "T+1 净收益%(交易约束后)",
+        "ret_close_t2_net": "T+2 净收益%(交易约束后)",
+        "ret_close_t3_net": "T+3 净收益%(交易约束后)",
+        "ret_close_t5_net": "T+5 净收益%(交易约束后)",
+        "ret_close_t10_net": "T+10 净收益%(交易约束后)",
+        "t0_trade_date": "T0交易日",
+        "t0_close": "T0收盘价",
+        "t1_trade_date": "T+1交易日",
+        "t2_trade_date": "T+2交易日",
+        "t3_trade_date": "T+3交易日",
+        "t5_trade_date": "T+5交易日",
+        "t10_trade_date": "T+10交易日",
+        "t1_close": "T+1收盘价",
+        "t2_close": "T+2收盘价",
+        "t3_close": "T+3收盘价",
+        "t5_close": "T+5收盘价",
+        "t10_close": "T+10收盘价",
         "hit_stop_loss": "是否触发止损",
         "hit_take_profit": "是否触发止盈",
+        "trade_block_reason": "交易受限原因",
         "n": "样本数",
         "mean_ret": "平均收益%",
         "median_ret": "中位收益%",
@@ -97,7 +115,13 @@ with c1:
 with c2:
     do_batch = st.button("更新全部未完成 run", help="对缺复评或状态未完成的 run 逐个拉行情（较慢）")
 with c3:
-    pass
+    use_net_for_summary = st.checkbox("统计使用净收益", value=True, help="勾选后组合统计/分层表现优先使用交易约束后的净收益列。")
+
+with st.expander("交易约束参数（基础版）", expanded=False):
+    fee_bps = st.number_input("单边手续费(bps)", min_value=0.0, max_value=100.0, value=5.0, step=0.5)
+    slippage_bps = st.number_input("单边滑点(bps)", min_value=0.0, max_value=100.0, value=8.0, step=0.5)
+    block_limit_up_at_t1 = st.checkbox("T+1 涨停视作难买入（净收益记空）", value=True)
+    limit_up_threshold_pct = st.number_input("涨停判定阈值(%)", min_value=0.0, max_value=30.0, value=9.8, step=0.1)
 
 if do_eval:
     cands = load_run_candidates(choice)
@@ -106,7 +130,13 @@ if do_eval:
     else:
         bar = st.progress(0, text="正在多周期复评（逐票请求行情）...")
         try:
-            result = evaluate_multi_horizon(cands)
+            result = evaluate_multi_horizon(
+                cands,
+                fee_bps=float(fee_bps),
+                slippage_bps=float(slippage_bps),
+                block_limit_up_at_t1=bool(block_limit_up_at_t1),
+                limit_up_threshold_pct=float(limit_up_threshold_pct),
+            )
             bar.progress(100, text="写入文件...")
             out_p = run_evaluation_path(choice)
             out_p.parent.mkdir(parents=True, exist_ok=True)
@@ -141,7 +171,13 @@ if do_batch:
             if cands is None or cands.empty:
                 continue
             try:
-                result = evaluate_multi_horizon(cands)
+                result = evaluate_multi_horizon(
+                    cands,
+                    fee_bps=float(fee_bps),
+                    slippage_bps=float(slippage_bps),
+                    block_limit_up_at_t1=bool(block_limit_up_at_t1),
+                    limit_up_threshold_pct=float(limit_up_threshold_pct),
+                )
                 out_p = run_evaluation_path(rid)
                 result.to_csv(out_p, index=False, encoding="utf-8-sig")
             except Exception:
@@ -155,10 +191,19 @@ if ev_df is None or ev_df.empty:
     st.stop()
 
 st.subheader("单票表现")
-show_cols = ["symbol", "name", "total_score", "status"]
+show_cols = ["symbol", "name", "total_score", "status", "trade_block_reason", "t0_trade_date", "t0_close"]
 for col, lab in DISPLAY_RET:
     if col in ev_df.columns:
         show_cols.append(col)
+    net_col = f"{col}_net"
+    if net_col in ev_df.columns:
+        show_cols.append(net_col)
+    date_col = col.replace("ret_close_", "").replace("t", "t") + "_trade_date"
+    close_col = col.replace("ret_close_", "").replace("t", "t") + "_close"
+    if date_col in ev_df.columns:
+        show_cols.append(date_col)
+    if close_col in ev_df.columns:
+        show_cols.append(close_col)
 for col in ev_df.columns:
     if col.startswith("max_drawdown") or col.startswith("max_runup"):
         show_cols.append(col)
@@ -172,8 +217,12 @@ st.dataframe(_rename_for_display(ev_df[show_cols]), use_container_width=True)
 st.subheader("组合统计（等权看待选列表）")
 cols_m = []
 for col, lab in DISPLAY_RET:
-    if col in ev_df.columns:
-        s = portfolio_summary(ev_df, col)
+    chosen = col
+    net_col = f"{col}_net"
+    if use_net_for_summary and net_col in ev_df.columns:
+        chosen = net_col
+    if chosen in ev_df.columns:
+        s = portfolio_summary(ev_df, chosen)
         if s:
             cols_m.append({"周期": lab, **{k: s.get(k) for k in s}})
 
@@ -183,9 +232,13 @@ if cols_m:
 
 st.subheader("分层表现（按综合得分排序）")
 for col, lab in DISPLAY_RET:
-    if col not in ev_df.columns:
+    chosen = col
+    net_col = f"{col}_net"
+    if use_net_for_summary and net_col in ev_df.columns:
+        chosen = net_col
+    if chosen not in ev_df.columns:
         continue
-    ls = layer_summary(ev_df, ret_col=col)
+    ls = layer_summary(ev_df, ret_col=chosen)
     if not ls.empty:
         st.markdown(f"**{lab}**")
         st.dataframe(_rename_for_display(ls), use_container_width=True)

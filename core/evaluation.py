@@ -157,10 +157,16 @@ def evaluate_multi_horizon(
     *,
     stop_loss_pct: float = -5.0,
     take_profit_pct: float = 10.0,
+    fee_bps: float = 5.0,
+    slippage_bps: float = 8.0,
+    block_limit_up_at_t1: bool = True,
+    limit_up_threshold_pct: float = 9.8,
 ) -> pd.DataFrame:
     """
     输入候选表（须含 symbol, snapshot_time；建议含 name, theme, total_score）。
-    输出追加多周期收益、回撤、标签与 status。
+    输出追加多周期收益、回撤、交易约束净收益、标签与 status。
+    - fee_bps/slippage_bps: 单边 bps，净收益按双边成本扣减
+    - block_limit_up_at_t1: 若 T+1 涨幅超过阈值，视作难以买入，净收益记为 NA
     """
     import akshare as ak
 
@@ -171,16 +177,23 @@ def evaluate_multi_horizon(
         raise ValueError(f"缺少字段: {need - set(df.columns)}")
 
     out = df.copy()
+    out["t0_trade_date"] = pd.NA
+    out["t0_close"] = pd.NA
     for n in HORIZONS:
         out[f"ret_close_t{n}"] = pd.NA
+        out[f"t{n}_trade_date"] = pd.NA
+        out[f"t{n}_close"] = pd.NA
+        out[f"ret_close_t{n}_net"] = pd.NA
     for w in (3, 5, 10):
         out[f"max_drawdown_t{w}"] = pd.NA
         out[f"max_runup_t{w}"] = pd.NA
     out["hit_stop_loss"] = pd.NA
     out["hit_take_profit"] = pd.NA
+    out["trade_block_reason"] = ""
     out["status"] = "数据不足"
 
     end_date = datetime.now().strftime("%Y%m%d")
+    round_trip_cost_pct = (max(0.0, fee_bps) * 2.0 + max(0.0, slippage_bps) * 2.0) / 100.0
 
     for idx, row in out.iterrows():
         symbol = format_symbol_for_ak(row["symbol"])
@@ -207,24 +220,55 @@ def evaluate_multi_horizon(
             continue
         if t0_close <= 0:
             continue
+        out.at[idx, "t0_trade_date"] = pd.to_datetime(t0["日期"]).strftime("%Y-%m-%d")
+        out.at[idx, "t0_close"] = round(t0_close, 4)
 
         rets: dict[int, float | None] = {}
+        close_by_n: dict[int, float | None] = {}
+        date_by_n: dict[int, str | None] = {}
         ok_horizons = 0
         for n in HORIZONS:
             _t0, tk = _kth_trading_row_after(hist, snapshot_date, n)
             if tk is None:
                 rets[n] = None
+                close_by_n[n] = None
+                date_by_n[n] = None
                 continue
             try:
                 ck = float(tk["收盘"])
                 rets[n] = round((ck / t0_close - 1.0) * 100.0, 4)
+                close_by_n[n] = ck
+                date_by_n[n] = pd.to_datetime(tk["日期"]).strftime("%Y-%m-%d")
                 ok_horizons += 1
             except Exception:
                 rets[n] = None
+                close_by_n[n] = None
+                date_by_n[n] = None
 
         for n in HORIZONS:
             if rets.get(n) is not None:
                 out.at[idx, f"ret_close_t{n}"] = rets[n]
+            if date_by_n.get(n):
+                out.at[idx, f"t{n}_trade_date"] = date_by_n[n]
+            if close_by_n.get(n) is not None:
+                out.at[idx, f"t{n}_close"] = round(float(close_by_n[n]), 4)
+
+        t1_raw = rets.get(1)
+        blocked = bool(
+            block_limit_up_at_t1
+            and t1_raw is not None
+            and float(t1_raw) >= float(limit_up_threshold_pct)
+        )
+        if blocked:
+            out.at[idx, "trade_block_reason"] = f"T+1涨幅≥{float(limit_up_threshold_pct):.2f}% 视作难买入"
+        for n in HORIZONS:
+            raw = rets.get(n)
+            if raw is None:
+                continue
+            if blocked:
+                out.at[idx, f"ret_close_t{n}_net"] = pd.NA
+            else:
+                out.at[idx, f"ret_close_t{n}_net"] = round(float(raw) - round_trip_cost_pct, 4)
 
         for w in (3, 5, 10):
             win = _window_rows(hist, snapshot_date, w)
@@ -246,18 +290,32 @@ def evaluate_multi_horizon(
                 out.at[idx, "hit_take_profit"] = bool(best_ret >= take_profit_pct)
 
         if ok_horizons >= 5:
-            out.at[idx, "status"] = "已完成"
+            out.at[idx, "status"] = "已完成" if not blocked else "受限(涨停难买)"
         elif ok_horizons > 0:
-            out.at[idx, "status"] = "待更新"
+            out.at[idx, "status"] = "待更新" if not blocked else "受限(涨停难买)"
         else:
             out.at[idx, "status"] = "数据不足"
 
     return out
 
 
-def evaluate_csv_to_path(input_csv: Path, output_csv: Path) -> Path:
+def evaluate_csv_to_path(
+    input_csv: Path,
+    output_csv: Path,
+    *,
+    fee_bps: float = 5.0,
+    slippage_bps: float = 8.0,
+    block_limit_up_at_t1: bool = True,
+    limit_up_threshold_pct: float = 9.8,
+) -> Path:
     df = pd.read_csv(input_csv, dtype={"symbol": str})
-    result = evaluate_multi_horizon(df)
+    result = evaluate_multi_horizon(
+        df,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        block_limit_up_at_t1=block_limit_up_at_t1,
+        limit_up_threshold_pct=limit_up_threshold_pct,
+    )
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(output_csv, index=False, encoding="utf-8-sig")
     return output_csv
