@@ -13,9 +13,16 @@
 - 支持导出到 `output/`
 - 自动生成“次日复评模板”CSV，便于回测验证评分有效性
 
+## 闭环（run + 复评 + 权重实验）
+
+- 每次在首页「运行筛选」会生成 `run_id`，并写入 `data/runs.csv` 与 `data/run_candidates/{run_id}.csv`
+- 侧边栏进入 **复评中心**：选择 run →「更新复评数据」生成 `data/run_evaluations/{run_id}.csv`（多周期脚本见下）
+- **参数实验室**：对已复评的多个 run 做权重回放，可将推荐权重保存为 `data/ui_default_weights.json`（首页侧边栏滑块默认值）
+
 ## 目录结构
 
-- `app/main.py`：UI 入口
+- `app/main.py`：UI 入口（筛选与出池）
+- `app/pages/`：复评中心、参数实验室（多页面）
 - `core/models.py`：数据模型
 - `core/scoring.py`：打分引擎
 - `core/data_provider.py`：数据源与指标计算（自动采集 + 样例数据）
@@ -70,6 +77,18 @@ python scripts/evaluate_candidates_next_day.py --input output/candidates_YYYYMMD
 
 - `output/candidates_YYYYMMDD_HHMMSS_evaluated.csv`
 
+多周期复评（T+1～T+10，与 UI 复评中心逻辑一致）：
+
+```bash
+python scripts/evaluate_candidates_multi_horizon.py --input data/run_candidates/run_xxx.csv --output data/run_evaluations/run_xxx.csv
+```
+
+权重实验（命令行）：
+
+```bash
+python scripts/experiment_weights.py --ret-col ret_close_t5 --mode random --n-random 100
+```
+
 ## 指标来源
 
 - `pct_chg`：涨跌幅（实时行情）
@@ -94,3 +113,9 @@ python scripts/evaluate_candidates_next_day.py --input output/candidates_YYYYMMD
 
 - 加入分钟级别“分歧转一致”触发检测
 - 对接你的交易日志做策略回测和迭代
+
+## 闭环复盘文档
+
+- `docs/18-盈利闭环操作系统.md`
+- `docs/20-周度复盘模板.csv`
+- `docs/21-调参实验记录.csv`

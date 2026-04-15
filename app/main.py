@@ -12,11 +12,37 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.data_provider import fetch_live_signals, load_sample_signals
+from core.health_score import compute_health_score
+from core.run_store import (
+    append_collection_history,
+    append_run,
+    load_default_weights,
+    new_run_id,
+    recent_collection_success_rate,
+    save_run_candidates,
+)
 from core.scoring import score_frame
 
 SAMPLE_DATA_PATH = PROJECT_ROOT / "data" / "sample_stocks.csv"
 LIVE_DATA_PATH = PROJECT_ROOT / "data" / "latest_signals.csv"
 OUTPUT_DIR = PROJECT_ROOT / "output"
+
+
+def _ensure_live_meta_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """样例数据等缺少快照/来源字段时补齐，便于 run 持久化与健康度。"""
+    out = frame.copy()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if "snapshot_time" not in out.columns:
+        out["snapshot_time"] = now
+    if "source" not in out.columns:
+        out["source"] = "sample_offline"
+    if "theme_source" not in out.columns:
+        out["theme_source"] = "spot"
+    if "turnover_source" not in out.columns:
+        out["turnover_source"] = "spot"
+    if "volume_ratio_source" not in out.columns:
+        out["volume_ratio_source"] = "spot"
+    return out
 
 # 仅用于界面展示；导出 CSV 仍保留英文字段名，便于脚本与复盘对接
 DISPLAY_COLUMN_LABELS: dict[str, str] = {
@@ -314,6 +340,9 @@ def main() -> None:
     with st.expander("计算与打分原理（与 `core/data_provider.py`、`core/scoring.py` 一致）", expanded=False):
         st.markdown(SCORING_AND_PIPELINE_MARKDOWN)
 
+    defaults = load_default_weights()
+    w_def = defaults or {}
+
     with st.sidebar:
         st.subheader("数据源")
         data_source = st.radio("选择数据来源", ["自动采集（推荐）", "样例数据（离线演示）"], index=0)
@@ -327,10 +356,18 @@ def main() -> None:
         use_local_btn = st.button("手动加载本地缓存数据")
 
         st.subheader("评分参数")
-        raw_theme = st.slider("题材强度权重", 0.0, 1.0, 0.30, 0.05)
-        raw_sector = st.slider("板块联动权重", 0.0, 1.0, 0.25, 0.05)
-        raw_stock = st.slider("个股强度权重", 0.0, 1.0, 0.25, 0.05)
-        raw_capital = st.slider("资金承接权重", 0.0, 1.0, 0.20, 0.05)
+        raw_theme = st.slider(
+            "题材强度权重", 0.0, 1.0, float(w_def.get("w_theme", 0.30)), 0.05
+        )
+        raw_sector = st.slider(
+            "板块联动权重", 0.0, 1.0, float(w_def.get("w_sector", 0.25)), 0.05
+        )
+        raw_stock = st.slider(
+            "个股强度权重", 0.0, 1.0, float(w_def.get("w_stock", 0.25)), 0.05
+        )
+        raw_capital = st.slider(
+            "资金承接权重", 0.0, 1.0, float(w_def.get("w_capital", 0.20)), 0.05
+        )
         score_threshold = st.slider("最低入选分数", 0.0, 100.0, 70.0, 1.0)
         top_n = st.slider("展示候选数量", 1, 20, 10, 1)
         run_btn = st.button("运行筛选", type="primary")
@@ -361,10 +398,12 @@ def main() -> None:
             LIVE_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
             live.to_csv(LIVE_DATA_PATH, index=False, encoding="utf-8-sig")
             progress.progress(100, text="实时数据刷新完成")
+            src = str(live["source"].iloc[0]) if "source" in live.columns else "unknown"
+            append_collection_history(True, src)
             st.success(f"自动采集完成：{LIVE_DATA_PATH}（{len(live)} 条）")
         except Exception as exc:
             progress.empty()
-            st.error(f"自动采集失败：{exc}")
+            append_collection_history(False, "error", str(exc))
             st.info("系统不会自动回退。你可以点击“手动加载本地缓存数据”或切换“样例数据（离线演示）”。")
 
     if use_local_btn:
@@ -385,7 +424,7 @@ def main() -> None:
                     st.error(f"你选择了本地缓存数据，但文件不存在：{LIVE_DATA_PATH}")
                     return
                 progress.progress(30, text="正在加载本地缓存数据...")
-                frame = pd.read_csv(LIVE_DATA_PATH)
+                frame = _ensure_live_meta_columns(pd.read_csv(LIVE_DATA_PATH))
                 st.info("当前使用本地缓存数据（手动选择）。")
                 st.session_state["force_local_file"] = False
             else:
@@ -405,15 +444,19 @@ def main() -> None:
                     progress.progress(60, text="正在写入缓存文件...")
                     LIVE_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
                     frame.to_csv(LIVE_DATA_PATH, index=False, encoding="utf-8-sig")
+                    src = str(frame["source"].iloc[0]) if "source" in frame.columns else "unknown"
+                    append_collection_history(True, src)
                 except Exception as exc:
                     progress.empty()
+                    append_collection_history(False, "error", str(exc))
                     st.error(f"实时采集失败：{exc}")
                     st.info("请先处理网络/代理问题，或点击“手动加载本地缓存数据”。")
                     return
         else:
             progress.progress(30, text="正在加载样例数据...")
-            frame = load_sample_signals(SAMPLE_DATA_PATH)
+            frame = _ensure_live_meta_columns(load_sample_signals(SAMPLE_DATA_PATH))
 
+        frame = _ensure_live_meta_columns(frame)
         progress.progress(80, text="正在计算评分与筛选...")
         scored = score_frame(frame, w_theme, w_sector, w_stock, w_capital)
         filtered = scored[scored["total_score"] >= score_threshold].head(top_n)
@@ -422,7 +465,53 @@ def main() -> None:
         if "theme_source" in scored.columns and (scored["theme_source"] == "unknown").mean() > 0.7:
             st.info("当前处于无行业模式（行业字段覆盖不足），建议降低题材强度/板块联动权重，先验证主流程。")
 
+        source_used = str(scored["source"].iloc[0]) if "source" in scored.columns else "unknown"
+        degraded = source_used != "eastmoney_em"
+        recent_rate = recent_collection_success_rate()
+        health_score, health_notes, _health_detail = compute_health_score(
+            scored,
+            source_used=source_used,
+            degraded=degraded,
+            recent_collection_rate=recent_rate,
+        )
+
         render_data_quality_panel(scored)
+
+        run_id = new_run_id()
+        scope_label = market_scope
+        ds_label = "自动采集" if data_source == "自动采集（推荐）" else "样例数据"
+        append_run(
+            run_id,
+            w_theme=w_theme,
+            w_sector=w_sector,
+            w_stock=w_stock,
+            w_capital=w_capital,
+            score_threshold=score_threshold,
+            top_n=top_n,
+            market_scope=scope_label,
+            refresh_limit=refresh_limit,
+            data_source=ds_label,
+            source_used=source_used,
+            degraded=degraded,
+            health_score=health_score,
+            health_notes=health_notes,
+            candidate_count=len(filtered),
+            track_eval=True,
+        )
+        save_run_candidates(run_id, filtered)
+
+        st.subheader("本次运行（闭环）")
+        c_run1, c_run2, c_run3 = st.columns(3)
+        c_run1.metric("run_id", run_id)
+        c_run2.metric("数据健康分", f"{health_score}")
+        c_run3.metric("备源降级", "是" if degraded else "否")
+        st.caption(
+            f"当前数据源：{SOURCE_DISPLAY_LABELS.get(source_used, source_used)} ｜ "
+            f"持续复评：已纳入（候选已写入 data/run_candidates）｜ "
+            f"健康说明：{health_notes}"
+        )
+        if degraded:
+            st.warning("当前未使用东财主源，量比等字段可能缺失，评分已按规则降权；建议网络恢复后重采。")
 
         st.subheader("候选股结果")
         st.dataframe(dataframe_for_display(filtered), use_container_width=True)
