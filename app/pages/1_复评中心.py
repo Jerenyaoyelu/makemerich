@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.evaluation import evaluate_multi_horizon, layer_summary, portfolio_summary
+from core.selection_tags import annotate_with_selection_tags
 from core.run_store import (
     append_strategy_report,
     list_runs,
@@ -59,6 +60,9 @@ def _display_name(col: str) -> str:
         "hit_stop_loss": "是否触发止损",
         "hit_take_profit": "是否触发止盈",
         "trade_block_reason": "交易受限原因",
+        "selection_tags": "选股标签",
+        "selection_alert": "提醒级别",
+        "selection_tooltip": "触发说明",
         "n": "样本数",
         "mean_ret": "平均收益%",
         "median_ret": "中位收益%",
@@ -190,8 +194,21 @@ if ev_df is None or ev_df.empty:
     st.warning("暂无复评结果文件。请点击「更新复评数据」。")
     st.stop()
 
+ev_df = annotate_with_selection_tags(ev_df)
+
 st.subheader("单票表现")
-show_cols = ["symbol", "name", "total_score", "status", "trade_block_reason", "t0_trade_date", "t0_close"]
+show_cols = [
+    "symbol",
+    "name",
+    "total_score",
+    "selection_tags",
+    "selection_alert",
+    "selection_tooltip",
+    "status",
+    "trade_block_reason",
+    "t0_trade_date",
+    "t0_close",
+]
 for col, lab in DISPLAY_RET:
     if col in ev_df.columns:
         show_cols.append(col)

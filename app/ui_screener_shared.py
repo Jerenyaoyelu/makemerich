@@ -8,6 +8,7 @@ import streamlit as st
 
 from core.health_score import compute_health_score
 from core.run_store import append_run, new_run_id, recent_collection_success_rate, save_run_candidates
+from core.selection_tags import annotate_with_selection_tags
 
 # 仅用于界面展示；导出 CSV 仍保留英文字段名
 DISPLAY_COLUMN_LABELS: dict[str, str] = {
@@ -32,6 +33,9 @@ DISPLAY_COLUMN_LABELS: dict[str, str] = {
     "theme_source": "行业来源",
     "turnover_source": "换手来源",
     "volume_ratio_source": "量比来源",
+    "selection_tags": "选股标签",
+    "selection_alert": "提醒级别",
+    "selection_tooltip": "触发说明",
 }
 
 DISPLAY_COLUMN_ORDER: list[str] = [
@@ -56,6 +60,9 @@ DISPLAY_COLUMN_ORDER: list[str] = [
     "theme_source",
     "turnover_source",
     "volume_ratio_source",
+    "selection_tags",
+    "selection_alert",
+    "selection_tooltip",
 ]
 
 SOURCE_DISPLAY_LABELS: dict[str, str] = {
@@ -241,6 +248,7 @@ def finalize_screener_run(
         candidate_count=len(filtered),
         track_eval=True,
     )
+    filtered = annotate_with_selection_tags(filtered)
     save_run_candidates(run_id, filtered)
 
     st.subheader("本次运行（闭环）")

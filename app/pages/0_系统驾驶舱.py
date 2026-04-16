@@ -17,6 +17,7 @@ from core.run_store import (
     list_runs,
     load_run_evaluation,
 )
+from core.selection_tags import build_high_frequency_leaderboard
 from core.walk_forward import WalkForwardConfig, walk_forward_report
 
 st.set_page_config(page_title="系统驾驶舱", page_icon="🧭", layout="wide")
@@ -123,6 +124,45 @@ else:
     st.caption("说明：每个 run 的收益统计来自对应复评文件中的优先口径（优先 net 列）。")
     dist = pd.DataFrame({"mean_ret": recent_eval["mean_ret"]})
     st.bar_chart(dist)
+
+st.subheader("高频入选看板")
+st.caption("按近 N 次 run 的候选池聚合：入选次数、连续入选、复评收益与受限比例；标签规则与候选表一致。")
+hf_c1, hf_c2 = st.columns(2)
+hf_window = int(hf_c1.slider("统计窗口（最近几次 run）", 5, 50, 20, 1))
+hf_min_appear = int(hf_c2.slider("最少入选次数（过滤）", 1, 15, 2, 1))
+
+with st.spinner("正在汇总高频标的..."):
+    hf_df = build_high_frequency_leaderboard(
+        last_n_runs=hf_window,
+        min_appear=hf_min_appear,
+    )
+if hf_df is None or hf_df.empty:
+    st.info("暂无满足条件的标的：可多跑几次筛选/历史回测，或降低「最少入选次数」。")
+else:
+    show_hf = hf_df.rename(
+        columns={
+            "symbol_norm": "代码",
+            "name": "名称",
+            "appear_count": "入选次数",
+            "consecutive_runs": "连续入选(run)",
+            "eval_samples": "复评样本数",
+            "ret_mean_last3": "近3次收益均值%",
+            "ret_mean_last5": "近5次收益均值%",
+            "ret_std_last3": "近3次收益波动",
+            "block_ratio": "受限比例",
+            "selection_tags": "选股标签",
+            "selection_alert": "提醒级别",
+            "selection_tooltip": "触发说明",
+        }
+    )
+    st.dataframe(show_hf, use_container_width=True)
+    csv_bytes = hf_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        label="导出高频看板 CSV",
+        data=csv_bytes,
+        file_name=f"high_frequency_board_{hf_window}runs.csv",
+        mime="text/csv",
+    )
 
 st.subheader("滚动样本外（Walk-Forward）")
 wf_col1, wf_col2, wf_col3, wf_col4 = st.columns(4)
