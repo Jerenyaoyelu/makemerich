@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.evaluation import evaluate_multi_horizon, layer_summary, portfolio_summary
 from core.selection_tags import annotate_with_selection_tags
+from core.sell_rules import SellRuleConfig, apply_sell_rules, sell_action_summary
 from core.run_store import (
     append_strategy_report,
     list_runs,
@@ -60,6 +61,9 @@ def _display_name(col: str) -> str:
         "hit_stop_loss": "是否触发止损",
         "hit_take_profit": "是否触发止盈",
         "trade_block_reason": "交易受限原因",
+        "sell_action": "卖出动作",
+        "sell_reason": "卖出原因",
+        "sell_priority": "优先级",
         "selection_tags": "选股标签",
         "selection_alert": "提醒级别",
         "selection_tooltip": "触发说明",
@@ -195,6 +199,23 @@ if ev_df is None or ev_df.empty:
     st.stop()
 
 ev_df = annotate_with_selection_tags(ev_df)
+sell_cfg = SellRuleConfig()
+sell_df = apply_sell_rules(ev_df, sell_cfg)
+sell_sum = sell_action_summary(sell_df)
+
+st.subheader("卖出建议卡（MVP）")
+s1, s2, s3, s4, s5 = st.columns(5)
+s1.metric("止损", sell_sum.get("止损", 0))
+s2.metric("减仓", sell_sum.get("减仓", 0))
+s3.metric("分批止盈", sell_sum.get("分批止盈", 0))
+s4.metric("到期退出", sell_sum.get("到期退出", 0))
+s5.metric("持有观察", sell_sum.get("持有观察", 0))
+only_high_sell = st.checkbox("单票表现仅看高优先级卖出建议", value=False)
+if st.button("打开卖出决策中心"):
+    try:
+        st.switch_page("pages/4_卖出决策中心.py")
+    except Exception:
+        st.info("当前环境不支持自动跳转，请在左侧菜单打开「卖出决策中心」。")
 
 st.subheader("单票表现")
 show_cols = [
@@ -228,8 +249,25 @@ if "hit_stop_loss" in ev_df.columns:
     show_cols.append("hit_stop_loss")
 if "hit_take_profit" in ev_df.columns:
     show_cols.append("hit_take_profit")
-show_cols = [c for c in show_cols if c in ev_df.columns]
-st.dataframe(_rename_for_display(ev_df[show_cols]), use_container_width=True)
+show_cols += ["sell_action", "sell_reason", "sell_priority"]
+show_cols = [c for c in show_cols if c in sell_df.columns]
+view_sell = sell_df.copy()
+if only_high_sell and "sell_priority" in view_sell.columns:
+    view_sell = view_sell[view_sell["sell_priority"] == "高"].copy()
+
+def _priority_style(v: object) -> str:
+    if str(v) == "高":
+        return "background-color: #ffe6e6; color: #b00020; font-weight: 700;"
+    if str(v) == "中":
+        return "background-color: #fff5e6; color: #8a5a00; font-weight: 600;"
+    return "background-color: #eef7ee; color: #1f6f3f;"
+
+display_df = _rename_for_display(view_sell[show_cols])
+prio_col = _display_name("sell_priority")
+if prio_col in display_df.columns:
+    st.dataframe(display_df.style.map(_priority_style, subset=[prio_col]), use_container_width=True)
+else:
+    st.dataframe(display_df, use_container_width=True)
 
 st.subheader("组合统计（等权看待选列表）")
 cols_m = []

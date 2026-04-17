@@ -19,6 +19,11 @@ name = "复评中心"
 icon = "📊"
 
 [[pages]]
+path = "app/pages/4_卖出决策中心.py"
+name = "卖出决策中心"
+icon = "🛟"
+
+[[pages]]
 path = "app/pages/2_参数实验室.py"
 name = "参数实验室"
 icon = "🧪"

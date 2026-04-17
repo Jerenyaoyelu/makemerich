@@ -18,6 +18,7 @@ from core.run_store import (
     load_run_evaluation,
 )
 from core.selection_tags import build_high_frequency_leaderboard
+from core.sell_rules import SellRuleConfig, apply_sell_rules, sell_action_summary
 from core.walk_forward import WalkForwardConfig, walk_forward_report
 
 st.set_page_config(page_title="系统驾驶舱", page_icon="🧭", layout="wide")
@@ -124,6 +125,31 @@ else:
     st.caption("说明：每个 run 的收益统计来自对应复评文件中的优先口径（优先 net 列）。")
     dist = pd.DataFrame({"mean_ret": recent_eval["mean_ret"]})
     st.bar_chart(dist)
+
+st.subheader("卖出风险雷达（近20次 run）")
+radar_rows: list[pd.DataFrame] = []
+for rid in recent_runs["run_id"].astype(str).tolist():
+    ev = load_run_evaluation(rid)
+    if ev is not None and not ev.empty:
+        radar_rows.append(ev.copy())
+if not radar_rows:
+    st.info("近20次暂无可用复评明细，暂无法计算卖出风险雷达。")
+else:
+    radar_df = pd.concat(radar_rows, ignore_index=True)
+    advised = apply_sell_rules(radar_df, SellRuleConfig())
+    ssum = sell_action_summary(advised)
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("止损触发比例", f"{(ssum.get('止损', 0) / max(1, len(advised))) * 100:.1f}%")
+    r2.metric("减仓触发比例", f"{(ssum.get('减仓', 0) / max(1, len(advised))) * 100:.1f}%")
+    r3.metric("分批止盈比例", f"{(ssum.get('分批止盈', 0) / max(1, len(advised))) * 100:.1f}%")
+    r4.metric("持有观察比例", f"{(ssum.get('持有观察', 0) / max(1, len(advised))) * 100:.1f}%")
+    pie = (
+        pd.Series(ssum, name="count")
+        .rename_axis("action")
+        .reset_index()
+        .sort_values("count", ascending=False)
+    )
+    st.dataframe(pie, use_container_width=True)
 
 st.subheader("高频入选看板")
 st.caption("按近 N 次 run 的候选池聚合：入选次数、连续入选、复评收益与受限比例；标签规则与候选表一致。")
