@@ -1,3 +1,4 @@
+# 已由 app/main.py 中 st.Page / st.navigation 接管；此处仅作人工对照，Streamlit 不会读取本文件。
 [[pages]]
 path = "app/pages/0_系统驾驶舱.py"
 name = "系统驾驶舱（首页）"
